@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: read
+  packages: read
 
 jobs:
   build-disk:
@@ -24,17 +25,33 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Build container image
+      - name: Resolve image name
+        id: image
+        shell: bash
+        run: |
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "name=${repo}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull container image
         env:
-          ASTRALFORGE_IMAGE: localhost/astralforge:ci-${{ github.sha }}
-          ASTRALFORGE_GIT_SHA: ${{ github.sha }}
-          ASTRALFORGE_SOURCE: https://github.com/${{ github.repository }}
-        run: ./astralforge build
+          ASTRALFORGE_IMAGE: ${{ steps.image.outputs.name }}:latest
+        run: |
+          podman pull "$ASTRALFORGE_IMAGE" || {
+            echo "::error::Missing GHCR image: $ASTRALFORGE_IMAGE. Run the container image workflow first."
+            exit 1
+          }
 
       - name: Build ${{ inputs.type }} artifact
         id: disk
         env:
-          ASTRALFORGE_IMAGE: localhost/astralforge:ci-${{ github.sha }}
+          ASTRALFORGE_IMAGE: ${{ steps.image.outputs.name }}:latest
         shell: bash
         run: |
           artifact="$(./astralforge build-disk '${{ inputs.type }}')"

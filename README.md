@@ -15,6 +15,7 @@ A minimal Fedora Silverblue custom image template. Only **600+** lines bash and 
    - Every pull request
    - Daily at 10:05 UTC
    - Manual workflow dispatch
+4. Disk artifact builds, including ISO builds, use `ghcr.io/YOUR_USERNAME/YOUR_REPO_NAME:latest`. Run the container image workflow first, and make sure the GHCR image exists before starting a disk artifact workflow.
 
 Available tags:
 - `latest` - Latest build from main branch
@@ -26,10 +27,16 @@ Available tags:
 # Build container image
 ./astralforge build
 
-# Build disk images
+# Build disk images. Run ./astralforge build first so the target image exists locally.
 ./astralforge build-qcow2  # QCOW2 format
 ./astralforge build-raw    # RAW format
 ./astralforge build-iso    # ISO format
+```
+
+To make an installed system track a GHCR image instead of a local image, build the ISO with `ASTRALFORGE_IMAGE` set to the GHCR reference:
+
+```bash
+ASTRALFORGE_IMAGE=ghcr.io/YOUR_USERNAME/YOUR_REPO_NAME:latest ./astralforge build-iso
 ```
 
 ## Customize
