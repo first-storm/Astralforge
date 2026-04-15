@@ -318,10 +318,10 @@ sync_image_to_rootful() {
 	set +e
 	if [[ -n "$ASTRALFORGE_SUDO" ]]; then
 		"$ASTRALFORGE_PODMAN" save --format oci-archive "$ASTRALFORGE_IMAGE" |
-			"$ASTRALFORGE_SUDO" "$ASTRALFORGE_PODMAN" load
+			"$ASTRALFORGE_SUDO" "$ASTRALFORGE_PODMAN" load >&2
 	else
 		"$ASTRALFORGE_PODMAN" save --format oci-archive "$ASTRALFORGE_IMAGE" |
-			"$ASTRALFORGE_PODMAN" load
+			"$ASTRALFORGE_PODMAN" load >&2
 	fi
 	local status=$?
 	set -e
@@ -329,14 +329,25 @@ sync_image_to_rootful() {
 	((status == 0)) || die "Failed to sync '$ASTRALFORGE_IMAGE' into rootful Podman storage."
 }
 
+artifact_relpath() {
+	local type="$1"
+	case "$type" in
+	iso) printf 'bootiso/install.iso\n' ;;
+	qcow2) printf 'qcow2/disk.qcow2\n' ;;
+	raw) printf 'image/disk.raw\n' ;;
+	*) return 1 ;;
+	esac
+}
+
 find_artifact() {
 	local type="$1"
-	local dir="$ASTRALFORGE_OUTPUT_DIR/$type"
-	[[ -d "$dir" ]] || return 1
+	local relpath
+	relpath="$(artifact_relpath "$type")" || return 1
 
-	find "$dir" -maxdepth 3 -type f -printf '%T@ %p\n' |
-		sort -nr |
-		sed -n '1s/^[^ ]* //p'
+	local artifact
+	artifact="$ASTRALFORGE_OUTPUT_DIR/$relpath"
+	[[ -f "$artifact" ]] || return 1
+	printf '%s\n' "$artifact"
 }
 
 print_help() {
@@ -462,7 +473,7 @@ cmd_build_disk() {
 		args+=(-v "$config_abs:/config.toml:ro")
 	fi
 
-	args+=("$ASTRALFORGE_BIB_IMAGE" --type "$type")
+	args+=("$ASTRALFORGE_BIB_IMAGE" --output /output --type "$type")
 
 	if [[ -n "$ASTRALFORGE_ROOTFS" ]]; then
 		args+=(--rootfs "$ASTRALFORGE_ROOTFS")
@@ -480,15 +491,18 @@ cmd_build_disk() {
 		warn "bootc-image-builder needs read-write access to Podman storage. Only use a trusted builder image."
 	fi
 
-	run_hook pre-disk "$type"
-	run_or_die "bootc-image-builder failed while creating '$type'." run_sudo_cmd "$ASTRALFORGE_PODMAN" "${args[@]}"
+	run_hook pre-disk "$type" >&2
+	run_or_die "bootc-image-builder failed while creating '$type'." run_sudo_cmd "$ASTRALFORGE_PODMAN" "${args[@]}" >&2
 
 	local artifact
 	artifact="$(find_artifact "$type" || true)"
-	[[ -n "$artifact" || "$ASTRALFORGE_DRY_RUN" == "1" ]] || die "No '$type' artifact was found under '$ASTRALFORGE_OUTPUT_DIR/$type'."
+	local relpath
+	relpath="$(artifact_relpath "$type")"
+	[[ -n "$artifact" || "$ASTRALFORGE_DRY_RUN" == "1" ]] ||
+		die "No '$type' artifact was found at '$output_abs/$relpath'. Check the bootc-image-builder output layout if this persists."
 
 	if [[ -n "$artifact" ]]; then
-		run_hook post-disk "$type" "$artifact"
+		run_hook post-disk "$type" "$artifact" >&2
 		printf '%s\n' "$artifact"
 	fi
 }
