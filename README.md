@@ -39,6 +39,18 @@ To make an installed system track a GHCR image instead of a local image, build t
 ASTRALFORGE_IMAGE=ghcr.io/YOUR_USERNAME/YOUR_REPO_NAME:latest ./astralforge build-iso
 ```
 
+### Customize the ISO Installer
+
+ISO builds created by GitHub Actions already use `ghcr.io/YOUR_USERNAME/YOUR_REPO_NAME:latest`, so installed systems will track that image for future `bootc upgrade` runs. You usually do not need a Kickstart `%post` script to run `bootc switch`.
+
+This repository includes [iso.toml](iso.toml), a default installer configuration tuned for GNOME images.
+
+```bash
+ASTRALFORGE_IMAGE=ghcr.io/YOUR_USERNAME/YOUR_REPO_NAME:latest \
+ASTRALFORGE_BUILD_CONFIG=iso.toml \
+./astralforge build-iso
+```
+
 ## Customize
 
 Edit [build_files/build.sh](build_files/build.sh) to customize your image:

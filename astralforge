@@ -475,6 +475,9 @@ cmd_build_disk() {
 
 	args+=("$ASTRALFORGE_BIB_IMAGE" --output /output --type "$type")
 
+	if [[ -n "$ASTRALFORGE_BUILD_CONFIG" ]]; then
+		args+=(--config /config.toml)
+	fi
 	if [[ -n "$ASTRALFORGE_ROOTFS" ]]; then
 		args+=(--rootfs "$ASTRALFORGE_ROOTFS")
 	fi
