@@ -1,0 +1,58 @@
+name: Build disk artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      type:
+        description: Disk artifact type
+        required: true
+        default: qcow2
+        type: choice
+        options:
+          - qcow2
+          - raw
+          - iso
+
+permissions:
+  contents: read
+
+jobs:
+  build-disk:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build container image
+        env:
+          ASTRALFORGE_IMAGE: localhost/astralforge:ci-${{ github.sha }}
+          ASTRALFORGE_GIT_SHA: ${{ github.sha }}
+          ASTRALFORGE_SOURCE: https://github.com/${{ github.repository }}
+        run: ./astralforge build
+
+      - name: Build ${{ inputs.type }} artifact
+        id: disk
+        env:
+          ASTRALFORGE_IMAGE: localhost/astralforge:ci-${{ github.sha }}
+        shell: bash
+        run: |
+          artifact="$(./astralforge build-disk '${{ inputs.type }}')"
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+
+      - name: Upload ${{ inputs.type }} artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.type }}-${{ github.sha }}
+          path: ${{ steps.disk.outputs.artifact }}
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          {
+            echo '## Disk artifact'
+            echo
+            echo 'Type: `${{ inputs.type }}`'
+            echo
+            echo 'Path: `${{ steps.disk.outputs.artifact }}`'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,616 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROGRAM_NAME="${0##*/}"
+
+die() {
+	printf '%s: error: %s\n' "$PROGRAM_NAME" "$*" >&2
+	exit 1
+}
+
+warn() {
+	printf '%s: warning: %s\n' "$PROGRAM_NAME" "$*" >&2
+}
+
+info() {
+	printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+}
+
+debug_cmd() {
+	[[ "${ASTRALFORGE_VERBOSE:-0}" == "1" ]] || return 0
+	printf '%s: +' "$PROGRAM_NAME" >&2
+	printf ' %q' "$@" >&2
+	printf '\n' >&2
+}
+
+run_cmd() {
+	debug_cmd "$@"
+	if [[ "${ASTRALFORGE_DRY_RUN:-0}" == "1" ]]; then
+		info "[dry-run] skipped command above"
+		return 0
+	fi
+	"$@"
+}
+
+run_or_die() {
+	local message="$1"
+	shift
+	run_cmd "$@" || die "$message"
+}
+
+run_sudo_cmd() {
+	if [[ -n "${ASTRALFORGE_SUDO:-}" ]]; then
+		run_cmd "$ASTRALFORGE_SUDO" "$@"
+	else
+		run_cmd "$@"
+	fi
+}
+
+declare -A LOCKED_VARS=()
+declare -a CLI_CONFIG_FILES=()
+declare -a POSITIONAL_ARGS=()
+CLI_VERBOSE=0
+CLI_DRY_RUN=0
+CLI_DISABLE_HOOKS=0
+
+trim() {
+	local value="$1"
+	value="${value#"${value%%[![:space:]]*}"}"
+	value="${value%"${value##*[![:space:]]}"}"
+	printf '%s' "$value"
+}
+
+record_locked_vars() {
+	local var
+	while IFS= read -r var; do
+		LOCKED_VARS["$var"]=1
+	done < <(compgen -A variable ASTRALFORGE_ || true)
+}
+
+load_config_file() {
+	local file="$1"
+	[[ -e "$file" ]] || return 0
+	[[ -f "$file" ]] || die "Config path '$file' is not a regular file."
+	[[ -r "$file" ]] || die "Config file '$file' is not readable."
+
+	local raw line key value
+	local line_num=0
+	local had_error=0
+
+	while IFS= read -r raw || [[ -n "$raw" ]]; do
+		line_num=$((line_num + 1))
+		line="$(trim "$raw")"
+
+		[[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+
+		if [[ "$line" != *=* ]]; then
+			warn "Invalid config line in $file:$line_num (missing '='): $raw"
+			had_error=1
+			continue
+		fi
+
+		key="$(trim "${line%%=*}")"
+		value="$(trim "${line#*=}")"
+
+		if [[ ! "$key" =~ ^ASTRALFORGE_[A-Za-z0-9_]+$ ]]; then
+			warn "Invalid config key in $file:$line_num: $key"
+			had_error=1
+			continue
+		fi
+
+		if [[ ${#value} -ge 2 ]]; then
+			if [[ ${value:0:1} == '"' && ${value: -1} == '"' ]]; then
+				value="${value:1:${#value}-2}"
+			elif [[ ${value:0:1} == "'" && ${value: -1} == "'" ]]; then
+				value="${value:1:${#value}-2}"
+			fi
+		fi
+
+		if [[ -n "${LOCKED_VARS[$key]+x}" ]]; then
+			continue
+		fi
+
+		printf -v "$key" '%s' "$value"
+		export "${key?}"
+	done <"$file"
+
+	((had_error == 0)) || die "Invalid configuration found in '$file'."
+}
+
+apply_defaults() {
+	: "${ASTRALFORGE_IMAGE:=localhost/astralforge:latest}"
+	: "${ASTRALFORGE_BASE_IMAGE:=quay.io/fedora/fedora-silverblue:44}"
+	: "${ASTRALFORGE_CONTAINERFILE:=Containerfile}"
+	: "${ASTRALFORGE_CONTEXT:=.}"
+	: "${ASTRALFORGE_SOURCE:=}"
+	: "${ASTRALFORGE_GIT_SHA:=}"
+
+	: "${ASTRALFORGE_OUTPUT_DIR:=output}"
+	: "${ASTRALFORGE_BIB_IMAGE:=quay.io/centos-bootc/bootc-image-builder:latest}"
+	: "${ASTRALFORGE_ROOTFS:=btrfs}"
+	: "${ASTRALFORGE_BUILD_CONFIG:=}"
+	: "${ASTRALFORGE_USE_LIBREPO:=1}"
+	: "${ASTRALFORGE_CHOWN_OUTPUT:=1}"
+	: "${ASTRALFORGE_FORCE_SYNC:=0}"
+	: "${ASTRALFORGE_STORAGE_MOUNT_MODE:=ro}"
+
+	: "${ASTRALFORGE_PODMAN:=podman}"
+	: "${ASTRALFORGE_SUDO:=sudo}"
+	: "${ASTRALFORGE_HOOKS_DIR:=.astralforge-hooks}"
+	: "${ASTRALFORGE_VERBOSE:=0}"
+	: "${ASTRALFORGE_DRY_RUN:=0}"
+}
+
+collect_global_flags() {
+	POSITIONAL_ARGS=()
+
+	while (($# > 0)); do
+		case "$1" in
+		-v | --verbose)
+			CLI_VERBOSE=1
+			shift
+			;;
+		-n | --dry-run)
+			CLI_DRY_RUN=1
+			shift
+			;;
+		--no-hooks)
+			CLI_DISABLE_HOOKS=1
+			shift
+			;;
+		-C | --config)
+			[[ -n "${2:-}" ]] || die "--config requires a file path."
+			CLI_CONFIG_FILES+=("$2")
+			shift 2
+			;;
+		--)
+			shift
+			POSITIONAL_ARGS=("$@")
+			return 0
+			;;
+		-h | --help)
+			POSITIONAL_ARGS=(help)
+			return 0
+			;;
+		-*)
+			die "Unknown global flag '$1'. Run '$PROGRAM_NAME help' for usage."
+			;;
+		*)
+			POSITIONAL_ARGS=("$@")
+			return 0
+			;;
+		esac
+	done
+}
+
+apply_cli_overrides() {
+	((CLI_VERBOSE == 0)) || ASTRALFORGE_VERBOSE=1
+	((CLI_DRY_RUN == 0)) || ASTRALFORGE_DRY_RUN=1
+	((CLI_DISABLE_HOOKS == 0)) || ASTRALFORGE_HOOKS_DIR=""
+}
+
+json_escape() {
+	local value="$1"
+	value="${value//\\/\\\\}"
+	value="${value//\"/\\\"}"
+	value="${value//$'\n'/\\n}"
+	value="${value//$'\r'/\\r}"
+	value="${value//$'\t'/\\t}"
+	printf '%s' "$value"
+}
+
+list_config_vars() {
+	compgen -A variable ASTRALFORGE_ | sort
+}
+
+print_config_table() {
+	local var
+	while IFS= read -r var; do
+		printf '%-32s %s\n' "$var" "${!var}"
+	done < <(list_config_vars)
+}
+
+print_config_env() {
+	local var
+	while IFS= read -r var; do
+		printf 'export %s=%q\n' "$var" "${!var}"
+	done < <(list_config_vars)
+}
+
+print_config_json() {
+	local first=1
+	local var
+	printf '{\n'
+	while IFS= read -r var; do
+		((first == 1)) || printf ',\n'
+		printf '  "%s": "%s"' "$(json_escape "$var")" "$(json_escape "${!var}")"
+		first=0
+	done < <(list_config_vars)
+	printf '\n}\n'
+}
+
+require_cmd() {
+	local command="$1"
+	command -v "$command" >/dev/null 2>&1 || die "Required command '$command' was not found in PATH."
+}
+
+require_bash4() {
+	((BASH_VERSINFO[0] >= 4)) || die "Bash 4 or newer is required. Current Bash is ${BASH_VERSION}."
+}
+
+git_revision() {
+	if [[ -n "$ASTRALFORGE_GIT_SHA" ]]; then
+		printf '%s\n' "$ASTRALFORGE_GIT_SHA"
+		return 0
+	fi
+
+	if ! command -v git >/dev/null 2>&1; then
+		printf 'unknown\n'
+		return 0
+	fi
+
+	if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		printf 'unknown\n'
+		return 0
+	fi
+
+	if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
+		printf 'unknown\n'
+		return 0
+	fi
+
+	if [[ -n "$(git status --porcelain 2>/dev/null || true)" ]]; then
+		warn "Git working tree is dirty; using revision 'unknown'. Set ASTRALFORGE_GIT_SHA to override."
+		printf 'unknown\n'
+		return 0
+	fi
+
+	git rev-parse HEAD
+}
+
+run_hook() {
+	local hook_name="$1"
+	shift
+
+	[[ -n "$ASTRALFORGE_HOOKS_DIR" ]] || return 0
+
+	local hook_path="$ASTRALFORGE_HOOKS_DIR/$hook_name"
+	[[ -x "$hook_path" ]] || return 0
+
+	info "Running hook: $hook_name"
+	debug_cmd "$hook_path" "$@"
+
+	if [[ "$ASTRALFORGE_DRY_RUN" == "1" ]]; then
+		info "[dry-run] skipped hook '$hook_name'"
+		return 0
+	fi
+
+	set +e
+	"$hook_path" "$@"
+	local status=$?
+	set -e
+
+	((status == 0)) || die "Hook '$hook_name' exited with status $status."
+}
+
+ensure_local_image_exists() {
+	[[ "$ASTRALFORGE_DRY_RUN" == "1" ]] && return 0
+	"$ASTRALFORGE_PODMAN" image exists "$ASTRALFORGE_IMAGE" ||
+		die "Local image '$ASTRALFORGE_IMAGE' does not exist. Run '$PROGRAM_NAME build' first."
+}
+
+rootful_image_exists() {
+	if [[ -n "$ASTRALFORGE_SUDO" ]]; then
+		"$ASTRALFORGE_SUDO" "$ASTRALFORGE_PODMAN" image exists "$ASTRALFORGE_IMAGE" >/dev/null 2>&1
+	else
+		"$ASTRALFORGE_PODMAN" image exists "$ASTRALFORGE_IMAGE" >/dev/null 2>&1
+	fi
+}
+
+sync_image_to_rootful() {
+	info "Syncing '$ASTRALFORGE_IMAGE' into rootful Podman storage"
+
+	if [[ "$ASTRALFORGE_DRY_RUN" == "1" ]]; then
+		info "[dry-run] skipped podman save | podman load"
+		return 0
+	fi
+
+	set +e
+	if [[ -n "$ASTRALFORGE_SUDO" ]]; then
+		"$ASTRALFORGE_PODMAN" save --format oci-archive "$ASTRALFORGE_IMAGE" |
+			"$ASTRALFORGE_SUDO" "$ASTRALFORGE_PODMAN" load
+	else
+		"$ASTRALFORGE_PODMAN" save --format oci-archive "$ASTRALFORGE_IMAGE" |
+			"$ASTRALFORGE_PODMAN" load
+	fi
+	local status=$?
+	set -e
+
+	((status == 0)) || die "Failed to sync '$ASTRALFORGE_IMAGE' into rootful Podman storage."
+}
+
+find_artifact() {
+	local type="$1"
+	local dir="$ASTRALFORGE_OUTPUT_DIR/$type"
+	[[ -d "$dir" ]] || return 1
+
+	find "$dir" -maxdepth 3 -type f -printf '%T@ %p\n' |
+		sort -nr |
+		sed -n '1s/^[^ ]* //p'
+}
+
+print_help() {
+	cat <<EOF
+Astralforge is a small Bash CLI for bootc image workflows.
+
+Usage:
+  $PROGRAM_NAME [FLAGS] COMMAND [ARGS]
+
+Commands:
+  build                 Build the container image
+  build-qcow2           Build a qcow2 disk image
+  build-raw             Build a raw disk image
+  build-iso             Build an ISO image
+  build-disk TYPE       Build one of: qcow2, raw, iso
+  doctor                Show prerequisites and effective tooling
+  config                Print effective configuration
+  help                  Show this help
+
+Global flags:
+  -v, --verbose         Print commands before running them
+  -n, --dry-run         Print commands without executing them
+  -C, --config FILE     Load an extra config file (higher priority than project config)
+  --no-hooks            Disable hooks for this invocation
+
+Config priority (highest wins):
+  1. CLI flags
+  2. Environment variables
+  3. Files passed with --config
+  4. .astralforge.env
+  5. ~/.config/astralforge/config.env
+  6. Built-in defaults
+
+Examples:
+  $PROGRAM_NAME build
+  $PROGRAM_NAME -n build-qcow2
+  $PROGRAM_NAME config --format env
+  $PROGRAM_NAME config --get ASTRALFORGE_IMAGE
+EOF
+}
+
+cmd_build() {
+	(($# == 0)) || die "'build' does not accept positional arguments."
+
+	require_bash4
+	require_cmd "$ASTRALFORGE_PODMAN"
+	[[ -f "$ASTRALFORGE_CONTAINERFILE" ]] || die "Missing Containerfile: $ASTRALFORGE_CONTAINERFILE"
+	[[ -d "$ASTRALFORGE_CONTEXT" ]] || die "Missing build context: $ASTRALFORGE_CONTEXT"
+
+	local revision
+	revision="$(git_revision)"
+
+	local -a args=(
+		build
+		-f "$ASTRALFORGE_CONTAINERFILE"
+		-t "$ASTRALFORGE_IMAGE"
+		--build-arg "BASE_IMAGE=$ASTRALFORGE_BASE_IMAGE"
+		--build-arg "ASTRALFORGE_GIT_SHA=$revision"
+		--build-arg "ASTRALFORGE_SOURCE=$ASTRALFORGE_SOURCE"
+	)
+
+	if [[ "$revision" != "unknown" ]]; then
+		args+=(--label "org.opencontainers.image.revision=$revision")
+	fi
+	if [[ -n "$ASTRALFORGE_SOURCE" ]]; then
+		args+=(--label "org.opencontainers.image.source=$ASTRALFORGE_SOURCE")
+	fi
+
+	args+=("$ASTRALFORGE_CONTEXT")
+
+	run_hook pre-build
+	run_or_die "Podman build failed." "$ASTRALFORGE_PODMAN" "${args[@]}"
+	run_hook post-build
+
+	info "Built $ASTRALFORGE_IMAGE"
+}
+
+cmd_build_disk() {
+	(($# == 1)) || die "Usage: $PROGRAM_NAME build-disk TYPE"
+
+	local type="$1"
+	case "$type" in
+	qcow2 | raw | iso) ;;
+	*) die "Unsupported disk type '$type'. Use one of: qcow2, raw, iso." ;;
+	esac
+
+	require_bash4
+	require_cmd "$ASTRALFORGE_PODMAN"
+	[[ -n "$ASTRALFORGE_SUDO" ]] && require_cmd "$ASTRALFORGE_SUDO"
+
+	case "$ASTRALFORGE_STORAGE_MOUNT_MODE" in
+	ro | rw) ;;
+	*) die "ASTRALFORGE_STORAGE_MOUNT_MODE must be 'ro' or 'rw'." ;;
+	esac
+
+	ensure_local_image_exists
+
+	if [[ "$ASTRALFORGE_DRY_RUN" != "1" ]]; then
+		if [[ "$ASTRALFORGE_FORCE_SYNC" == "1" ]] || ! rootful_image_exists; then
+			sync_image_to_rootful
+		fi
+	fi
+
+	run_or_die "Could not create output directory '$ASTRALFORGE_OUTPUT_DIR'." mkdir -p "$ASTRALFORGE_OUTPUT_DIR"
+
+	local output_abs
+	output_abs="$(realpath -m "$ASTRALFORGE_OUTPUT_DIR")"
+
+	local -a args=(
+		run
+		--rm
+		--privileged
+		--pull=newer
+		--security-opt label=type:unconfined_t
+		-v "/var/lib/containers/storage:/var/lib/containers/storage:$ASTRALFORGE_STORAGE_MOUNT_MODE"
+		-v "$output_abs:/output"
+	)
+
+	if [[ -n "$ASTRALFORGE_BUILD_CONFIG" ]]; then
+		[[ -f "$ASTRALFORGE_BUILD_CONFIG" ]] || die "Missing build config: $ASTRALFORGE_BUILD_CONFIG"
+		local config_abs
+		config_abs="$(cd "$(dirname "$ASTRALFORGE_BUILD_CONFIG")" && pwd -P)/$(basename "$ASTRALFORGE_BUILD_CONFIG")"
+		args+=(-v "$config_abs:/config.toml:ro")
+	fi
+
+	args+=("$ASTRALFORGE_BIB_IMAGE" --type "$type")
+
+	if [[ -n "$ASTRALFORGE_ROOTFS" ]]; then
+		args+=(--rootfs "$ASTRALFORGE_ROOTFS")
+	fi
+	if [[ "$ASTRALFORGE_USE_LIBREPO" == "1" ]]; then
+		args+=(--use-librepo=True)
+	fi
+	if [[ "$ASTRALFORGE_CHOWN_OUTPUT" == "1" ]]; then
+		args+=(--chown "$(id -u):$(id -g)")
+	fi
+
+	args+=("$ASTRALFORGE_IMAGE")
+
+	if [[ "$ASTRALFORGE_STORAGE_MOUNT_MODE" == "rw" ]]; then
+		warn "Using read-write access to Podman storage. Only do this with a trusted bootc-image-builder image."
+	fi
+
+	run_hook pre-disk "$type"
+	run_or_die "bootc-image-builder failed while creating '$type'." run_sudo_cmd "$ASTRALFORGE_PODMAN" "${args[@]}"
+
+	local artifact
+	artifact="$(find_artifact "$type" || true)"
+	[[ -n "$artifact" || "$ASTRALFORGE_DRY_RUN" == "1" ]] || die "No '$type' artifact was found under '$ASTRALFORGE_OUTPUT_DIR/$type'."
+
+	if [[ -n "$artifact" ]]; then
+		run_hook post-disk "$type" "$artifact"
+		printf '%s\n' "$artifact"
+	fi
+}
+
+cmd_doctor() {
+	(($# == 0)) || die "'doctor' does not accept positional arguments."
+
+	require_bash4
+
+	printf '%-24s %s\n' bash "$BASH_VERSION"
+	if command -v "$ASTRALFORGE_PODMAN" >/dev/null 2>&1; then
+		printf '%-24s %s\n' podman "$("$ASTRALFORGE_PODMAN" --version 2>/dev/null || printf 'found')"
+	else
+		printf '%-24s %s\n' podman missing
+	fi
+	if command -v git >/dev/null 2>&1; then
+		printf '%-24s %s\n' git "$(git --version 2>/dev/null || printf 'found')"
+	else
+		printf '%-24s %s\n' git missing
+	fi
+	if [[ -n "$ASTRALFORGE_SUDO" ]] && command -v "$ASTRALFORGE_SUDO" >/dev/null 2>&1; then
+		printf '%-24s %s\n' sudo found
+	elif [[ -n "$ASTRALFORGE_SUDO" ]]; then
+		printf '%-24s %s\n' sudo missing
+	else
+		printf '%-24s %s\n' sudo disabled
+	fi
+	printf '%-24s %s\n' image "$ASTRALFORGE_IMAGE"
+	printf '%-24s %s\n' base-image "$ASTRALFORGE_BASE_IMAGE"
+	printf '%-24s %s\n' output-dir "$ASTRALFORGE_OUTPUT_DIR"
+}
+
+cmd_config() {
+	local format="table"
+	local get_var=""
+
+	while (($# > 0)); do
+		case "$1" in
+		--format)
+			[[ -n "${2:-}" ]] || die "--format requires a value."
+			format="$2"
+			shift 2
+			;;
+		--format=*)
+			format="${1#*=}"
+			shift
+			;;
+		--get)
+			[[ -n "${2:-}" ]] || die "--get requires a variable name."
+			get_var="$2"
+			shift 2
+			;;
+		*)
+			die "Unknown config option '$1'."
+			;;
+		esac
+	done
+
+	if [[ -n "$get_var" ]]; then
+		[[ "$get_var" =~ ^ASTRALFORGE_[A-Za-z0-9_]+$ ]] || die "Invalid config key '$get_var'."
+		[[ -n "${!get_var+x}" ]] || die "Unknown config key '$get_var'."
+		printf '%s\n' "${!get_var}"
+		return 0
+	fi
+
+	case "$format" in
+	table) print_config_table ;;
+	env) print_config_env ;;
+	json) print_config_json ;;
+	*) die "Unsupported config format '$format'. Use table, env, or json." ;;
+	esac
+}
+
+main() {
+	record_locked_vars
+	collect_global_flags "$@"
+
+	load_config_file "${XDG_CONFIG_HOME:-$HOME/.config}/astralforge/config.env"
+	load_config_file ".astralforge.env"
+
+	local config_file
+	for config_file in "${CLI_CONFIG_FILES[@]}"; do
+		load_config_file "$config_file"
+	done
+
+	apply_defaults
+	apply_cli_overrides
+
+	local command="${POSITIONAL_ARGS[0]:-help}"
+	case "$command" in
+	help | -h | --help)
+		((${#POSITIONAL_ARGS[@]} == 1 || ${#POSITIONAL_ARGS[@]} == 0)) || die "'help' does not accept positional arguments."
+		print_help
+		;;
+	build)
+		cmd_build "${POSITIONAL_ARGS[@]:1}"
+		;;
+	build-qcow2)
+		((${#POSITIONAL_ARGS[@]} == 1)) || die "'build-qcow2' does not accept positional arguments."
+		cmd_build_disk qcow2
+		;;
+	build-raw)
+		((${#POSITIONAL_ARGS[@]} == 1)) || die "'build-raw' does not accept positional arguments."
+		cmd_build_disk raw
+		;;
+	build-iso)
+		((${#POSITIONAL_ARGS[@]} == 1)) || die "'build-iso' does not accept positional arguments."
+		cmd_build_disk iso
+		;;
+	build-disk)
+		cmd_build_disk "${POSITIONAL_ARGS[@]:1}"
+		;;
+	doctor)
+		cmd_doctor "${POSITIONAL_ARGS[@]:1}"
+		;;
+	config)
+		cmd_config "${POSITIONAL_ARGS[@]:1}"
+		;;
+	*)
+		die "Unknown command '$command'. Run '$PROGRAM_NAME help' for usage."
+		;;
+	esac
+}
+
+main "$@"

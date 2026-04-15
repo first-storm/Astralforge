@@ -1,0 +1,88 @@
+name: Build container image
+
+on:
+  pull_request:
+    branches:
+      - master
+  schedule:
+    - cron: "05 10 * * *" # 10:05am UTC everyday
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve image name
+        id: image
+        shell: bash
+        run: |
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "name=${repo}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=sha,format=long,prefix=sha-
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build image
+        env:
+          ASTRALFORGE_IMAGE: ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
+          ASTRALFORGE_GIT_SHA: ${{ github.sha }}
+          ASTRALFORGE_SOURCE: https://github.com/${{ github.repository }}
+        run: |
+          ./astralforge build
+          primary="${ASTRALFORGE_IMAGE}"
+          while IFS= read -r tag; do
+            if [[ -n "$tag" && "$tag" != "$primary" ]]; then
+              podman tag "$primary" "$tag"
+            fi
+          done <<< "${{ steps.meta.outputs.tags }}"
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        run: |
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] && podman push "$tag"
+          done <<< "${{ steps.meta.outputs.tags }}"
+
+      - name: Summary
+        run: |
+          {
+            echo '## Container image'
+            echo
+            echo 'Image repository: `${{ steps.image.outputs.name }}`'
+            echo
+            echo '| Tag |'
+            echo '|-----|'
+          } >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] && echo "| \`${tag}\` |" >> "$GITHUB_STEP_SUMMARY"
+          done <<< "${{ steps.meta.outputs.tags }}"
+          if [[ '${{ github.event_name }}' == 'pull_request' ]]; then
+            echo >> "$GITHUB_STEP_SUMMARY"
+            echo '*Pull request build: not pushed.*' >> "$GITHUB_STEP_SUMMARY"
+          fi
