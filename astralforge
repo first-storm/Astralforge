@@ -132,7 +132,7 @@ apply_defaults() {
 	: "${ASTRALFORGE_USE_LIBREPO:=1}"
 	: "${ASTRALFORGE_CHOWN_OUTPUT:=1}"
 	: "${ASTRALFORGE_FORCE_SYNC:=0}"
-	: "${ASTRALFORGE_STORAGE_MOUNT_MODE:=ro}"
+	: "${ASTRALFORGE_STORAGE_MOUNT_MODE:=rw}"
 
 	: "${ASTRALFORGE_PODMAN:=podman}"
 	: "${ASTRALFORGE_SUDO:=sudo}"
@@ -477,7 +477,7 @@ cmd_build_disk() {
 	args+=("$ASTRALFORGE_IMAGE")
 
 	if [[ "$ASTRALFORGE_STORAGE_MOUNT_MODE" == "rw" ]]; then
-		warn "Using read-write access to Podman storage. Only do this with a trusted bootc-image-builder image."
+		warn "bootc-image-builder needs read-write access to Podman storage. Only use a trusted builder image."
 	fi
 
 	run_hook pre-disk "$type"
